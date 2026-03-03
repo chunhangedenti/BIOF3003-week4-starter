@@ -2,13 +2,14 @@
 import useCamera from './hooks/useCamera';
 import SimpleCard from './components/SimpleCard';
 import ChartComponent from './components/ChartComponent';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import usePPGFromSamples from './hooks/usePPGFromSamples';
 import { computePPGFromRGB } from './lib/ppg';
 import type { SignalCombinationMode } from './components/SignalCombinationSelector';
 import SignalCombinationSelector from './components/SignalCombinationSelector';
 
-const SAMPLES_TO_KEEP = 150;
+const SAMPLES_TO_KEEP = 200;
+const SEGMENT_LENGTH = 200;
 
 export default function Home() {
   const { videoRef, canvasRef, isRecording, setIsRecording, error } =
@@ -18,6 +19,122 @@ export default function Home() {
   const { valleys, heartRate, hrv } = usePPGFromSamples(samples);
   const [signalCombination, setSignalCombination] =
     useState<SignalCombinationMode>('default');
+
+  const [backendStatus, setBackendStatus] = useState<string | null>(null);
+  const [saveStatus, setSaveStatus] = useState<string | null>(null);
+
+  type SegmentLabel = 'good' | 'bad';
+  const [segmentLabel, setSegmentLabel] = useState<SegmentLabel>('good');
+  const [segmentStatus, setSegmentStatus] = useState<string | null>(null);
+
+  const [inferenceResult, setInferenceResult] = useState<{
+    label: string | null;
+    confidence: number;
+    message?: string;
+  } | null>(null);
+
+  const samplesRef = useRef<number[]>([]);
+  useEffect(() => {
+    samplesRef.current = samples;
+  }, [samples]);
+
+  const INFERENCE_INTERVAL_MS = 2500;
+  useEffect(() => {
+    if (!isRecording) return;
+    let cancelled = false;
+    async function run() {
+      const current = samplesRef.current;
+      if (current.length < SEGMENT_LENGTH) return;
+      const segment = current.slice(-SEGMENT_LENGTH);
+      try {
+        const res = await fetch('/api/infer-quality', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ppgData: segment }),
+        });
+        const data = await res.json();
+        if (!cancelled) {
+          setInferenceResult({
+            label: data.label ?? null,
+            confidence: data.confidence ?? 0,
+            message: data.message,
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setInferenceResult({
+            label: null,
+            confidence: 0,
+            message: 'Request failed',
+          });
+        }
+      }
+    }
+    run();
+    const id = setInterval(run, INFERENCE_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [isRecording]);
+
+  async function checkBackend() {
+    try {
+      const res = await fetch('/api/health');
+      const data = await res.json();
+      setBackendStatus(
+        data.ok ? 'Backend OK' : 'Backend returned unexpected data',
+      );
+    } catch (e) {
+      setBackendStatus('Backend unreachable');
+    }
+  }
+
+  async function sendLabeledSegment() {
+    if (samples.length < 50) {
+      setSegmentStatus('Need more samples (start recording first)');
+      return;
+    }
+    setSegmentStatus(null);
+    const ppgSegment = samples.slice(-SEGMENT_LENGTH);
+    try {
+      const res = await fetch('/api/save-labeled-segment', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ppgData: ppgSegment, label: segmentLabel }),
+      });
+      const data = await res.json();
+      if (data.success) setSegmentStatus(`Saved as ${segmentLabel}`);
+      else setSegmentStatus('Error: ' + (data.error || 'Unknown'));
+    } catch {
+      setSegmentStatus('Error: request failed');
+    }
+  }
+
+  async function saveRecord() {
+    setSaveStatus(null);
+    const record = {
+      heartRate: { bpm: heartRate.bpm, confidence: heartRate.confidence },
+      hrv: {
+        sdnn: hrv?.sdnn ?? 0,
+        confidence: hrv?.confidence ?? 0,
+      },
+      ppgData: samples.slice(-200),
+      timestamp: new Date().toISOString(),
+    };
+    try {
+      const res = await fetch('/api/save-record', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(record),
+      });
+      const data = await res.json();
+      if (data.success) setSaveStatus('Saved');
+      else setSaveStatus('Error: ' + (data.error || 'Unknown'));
+    } catch (e) {
+      setSaveStatus('Error: request failed');
+    }
+  }
 
   async function sendToApi() {
     const res = await fetch('/api/echo', {
@@ -158,17 +275,87 @@ export default function Home() {
           }
         />
       </div>
-      <button
-        onClick={sendToApi}
-        className="mt-4 px-4 py-2 bg-blue-500 text-white rounded"
-      >
-        Send to API
-      </button>
-      {apiResponse && (
-        <pre className="mt-2 p-2 bg-gray-100 rounded text-sm">
-          {JSON.stringify(apiResponse, null, 2)}
-        </pre>
-      )}
-    </main>
+      <div className="mt-4 flex flex-wrap gap-4">
+          <button
+            onClick={checkBackend}
+            className="px-4 py-2 bg-gray-500 text-white rounded"
+          >
+            Check backend
+          </button>
+          <button
+            onClick={saveRecord}
+            className="px-4 py-2 bg-green-500 text-white rounded"
+          >
+            Save record
+          </button>
+        </div>
+        {backendStatus && <p className="mt-2 text-sm">{backendStatus}</p>}
+        {saveStatus && <p className="mt-2 text-sm">{saveStatus}</p>}
+
+        <div className="mt-4 border-t pt-4">
+          <h3 className="font-medium mb-2">Collect labeled data (for ML)</h3>
+          <p className="text-sm text-gray-600 mb-2">
+            Choose a label, watch the signal until it matches, then click Send to
+            save this segment.
+          </p>
+          <div className="flex items-center gap-4 mb-2">
+            <label className="flex items-center gap-2">
+              <input
+                type="radio"
+                name="segmentLabel"
+                checked={segmentLabel === 'good'}
+                onChange={() => setSegmentLabel('good')}
+              />
+              Good
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="radio"
+                name="segmentLabel"
+                checked={segmentLabel === 'bad'}
+                onChange={() => setSegmentLabel('bad')}
+              />
+              Bad
+            </label>
+          </div>
+          <button
+            onClick={sendLabeledSegment}
+            className="px-4 py-2 bg-amber-500 text-white rounded"
+          >
+            Send labeled segment
+          </button>
+          {segmentStatus && <p className="mt-2 text-sm">{segmentStatus}</p>}
+        </div>
+
+        <div className="mt-4 border-t pt-4">
+          <h3 className="font-medium mb-2">Signal quality (ML inference)</h3>
+          <p className="text-sm text-gray-600 mb-2">
+            Quality updates continuously while recording (when enough samples are
+            available).
+          </p>
+          <div className="mt-2 text-sm">
+            {inferenceResult?.message && (
+              <p className="text-gray-600">{inferenceResult.message}</p>
+            )}
+            {inferenceResult?.label ? (
+              <p>
+                Predicted: <strong>{inferenceResult.label}</strong>
+                {inferenceResult.confidence > 0 &&
+                  ` (${(inferenceResult.confidence * 100).toFixed(0)}% confidence)`}
+              </p>
+            ) : (
+              <p className="text-gray-500">
+                {isRecording && samples.length < SEGMENT_LENGTH
+                  ? 'Collecting samples…'
+                  : !isRecording
+                    ? 'Start recording for quality inference'
+                    : '--'}
+              </p>
+            )}
+          </div>
+        </div>
+      </main>
+
+
   );
 }
